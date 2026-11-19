@@ -1,0 +1,5 @@
+news.db*
+public/
+__pycache__/
+.venv/
+feeds.local.*

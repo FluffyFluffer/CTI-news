@@ -1,0 +1,72 @@
+# Sources for the dashboard. Add a source = add a block here (or run: python cyber_dashboard.py add <url>).
+#
+# type: rss      -> direct feed URL
+# type: auto     -> any page URL; the feed is discovered automatically
+# type: sitemap  -> sitemap.xml; newest pages are read (optional: url_contains, limit)
+# type: scrape   -> plain HTML; CSS selectors: item (required), title, link (default: "a")
+# Optional on every source: limit (default 40), enabled (default true)
+
+- name: BleepingComputer
+  type: rss
+  url: https://www.bleepingcomputer.com/feed/
+
+- name: The Hacker News
+  type: rss
+  url: https://feeds.feedburner.com/TheHackersNews
+
+- name: Krebs on Security
+  type: rss
+  url: https://krebsonsecurity.com/feed/
+
+- name: The Record
+  type: rss
+  url: https://therecord.media/feed
+
+- name: SecurityWeek
+  type: rss
+  url: https://feeds.feedburner.com/securityweek
+
+- name: Dark Reading
+  type: rss
+  url: https://www.darkreading.com/rss.xml
+
+- name: Google Cloud / Mandiant
+  type: rss
+  url: https://cloudblog.withgoogle.com/topics/threat-intelligence/rss/
+
+- name: Microsoft Security
+  type: rss
+  url: https://www.microsoft.com/en-us/security/blog/feed/
+
+- name: CISA Alerts
+  type: rss
+  url: https://www.cisa.gov/cybersecurity-advisories/all.xml
+
+- name: Sekurak
+  type: rss
+  url: https://sekurak.pl/feed/
+
+- name: Niebezpiecznik
+  type: rss
+  url: https://niebezpiecznik.pl/feed/
+
+- name: Zaufana Trzecia Strona
+  type: rss
+  url: https://zaufanatrzeciastrona.pl/feed/
+
+- name: CERT Polska
+  type: auto
+  url: https://cert.pl
+
+# --- Examples (disabled) ---
+# - name: Some blog without a visible feed
+#   type: sitemap
+#   url: https://example.com/sitemap.xml
+#   url_contains: /blog/
+#
+# - name: Plain HTML news page
+#   type: scrape
+#   url: https://example.com/news
+#   item: "article.post"
+#   title: "h2 a"
+#   link: "h2 a"
