@@ -1,8 +1,7 @@
 # Cyber News Dashboard
 
 A self-hosted aggregator for cybersecurity news. It pulls articles from RSS feeds, sitemaps and plain HTML pages, enriches them (CVE extraction, CISA KEV flagging, topic tags) and renders a fast, searchable single-page dashboard with read/unread tracking that syncs across your devices.
-
-> **Live demo (sample data):** deploy the repo to GitHub Pages and put your link here.
+![example](example.png)
 
 ## Features
 
@@ -97,7 +96,7 @@ Items without a publication date (scraping) use the time they were first seen. S
 Self-hosted mode only. Open **Config** and use the **Users** and **Dashboards** boxes.
 
 - **Users:** add, rename, delete (max 20). A new user gets one dashboard, `Everything`. Existing read / Important flags from older versions are moved to the first user, `Default`, on the first start.
-- **Dashboards:** `+ New dashboard`, give it a name and tick the sources it should show, or choose *All sources* (it then also follows sources you add later). Nothing is saved until you press **Save**. Max 30 per user, at least one must remain.
+- **Dashboards:** `+ New dashboard`, give it a name and pick the sources it should show from a dropdown (with a filter box and *Select shown* / *Clear shown*, so long source lists stay manageable), or choose *All sources* (it then also follows sources you add later). Nothing is saved until you press **Save**. Max 30 per user, at least one must remain.
 - The header shows a 👤 menu once there is more than one user, and pills with unread counts once you have more than one dashboard. The last user and dashboard are remembered per browser.
 - Tags, search, tabs and "mark all as read" apply to the current dashboard. Important items older than 30 days are kept and shown in every dashboard that includes their source.
 
