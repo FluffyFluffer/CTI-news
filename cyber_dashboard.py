@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+import profiles
+
 BASE = Path(__file__).resolve().parent
 CONFIG = BASE / "feeds.yml"
 LOCAL_CONFIG = BASE / "feeds.local.yml"  # written by the UI (Config tab), not tracked by git
@@ -18,6 +20,9 @@ DB = str(BASE / "news.db")
 OUT = BASE / "public" / "index.html"
 KEEP_DAYS = 30
 DEFAULT_LIMIT = 40
+DEFAULT_REFRESH_MIN = 60   # server mode: minutes between automatic updates
+MIN_REFRESH_MIN = 10       # lower bound, to stay polite to the sites
+MAX_REFRESH_MIN = 1440
 UA = "cyber-news-dashboard/1.0 (+personal project)"
 FEED_MIME = {"application/rss+xml", "application/atom+xml"}
 COMMON_PATHS = ["/feed", "/feed/", "/rss", "/rss.xml", "/atom.xml", "/index.xml", "/feeds/posts/default"]
@@ -183,13 +188,31 @@ def init_db(path=DB):
     con.execute("""CREATE TABLE IF NOT EXISTS items(
         id TEXT PRIMARY KEY, title TEXT, url TEXT, source TEXT,
         published INTEGER, summary TEXT, cves TEXT, tags TEXT)""")
-    con.execute("CREATE TABLE IF NOT EXISTS read_state(url TEXT PRIMARY KEY)")
     con.execute("""CREATE TABLE IF NOT EXISTS source_status(
         name TEXT PRIMARY KEY, last_attempt INTEGER, last_success INTEGER, ok INTEGER,
         error TEXT, fetched INTEGER, new_items INTEGER)""")
     con.execute("""CREATE TABLE IF NOT EXISTS fetch_log(
         id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, source TEXT, level TEXT, message TEXT)""")
+    con.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
+    profiles.ensure_schema(con)  # users, dashboards, per-user flags (+ migration of older databases)
     return con
+
+
+def get_setting(con, key, default=None):
+    row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(con, key, value):
+    con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)", (key, str(value)))
+
+
+def get_refresh_minutes(con):
+    """Minutes between automatic updates in server mode (0 = manual only)."""
+    try:
+        return int(get_setting(con, "refresh_minutes", DEFAULT_REFRESH_MIN))
+    except (TypeError, ValueError):
+        return DEFAULT_REFRESH_MIN
 
 
 def store(con, source, entries):
@@ -224,6 +247,11 @@ def load_kev(max_age=6 * 3600):
     except Exception as e:
         print(f"[!] CISA KEV unavailable: {e}")
         return _KEV[1]  # a stale cache beats nothing
+
+
+def cached_kev():
+    """KEV ids already in memory (never touches the network)."""
+    return _KEV[1]
 
 
 # ---------- config + commands ----------
@@ -284,6 +312,9 @@ def set_status(con, name, ok, error="", fetched=0, new=0):
 def run_update(only=None):
     """Fetch all enabled sources (or just `only`), record status + log, rebuild the page."""
     con = init_db()
+    if not only:  # a full run restarts the schedule; set first so a crash cannot cause a retry loop
+        set_setting(con, "last_run", int(time.time()))
+        con.commit()
     sources = load_config()
     ok = failed = 0
     for src in sources:
@@ -300,8 +331,11 @@ def run_update(only=None):
             print(f"[!] {name}: {e}")
     now = int(time.time())
     log(con, "update", "info", f"finished: {ok} ok, {failed} failed" + (f" (only {only})" if only else ""))
-    con.execute("DELETE FROM items WHERE published < ?", (now - KEEP_DAYS * 86400,))
-    con.execute("DELETE FROM read_state WHERE url NOT IN (SELECT url FROM items)")
+    # items flagged Important are kept past the retention window
+    con.execute("DELETE FROM items WHERE published < ? AND url NOT IN (SELECT url FROM user_important)",
+                (now - KEEP_DAYS * 86400,))
+    con.execute("DELETE FROM user_read WHERE url NOT IN (SELECT url FROM items)")
+    con.execute("DELETE FROM user_important WHERE url NOT IN (SELECT url FROM items)")
     con.execute("DELETE FROM fetch_log WHERE ts < ?", (now - 14 * 86400,))
     names = [s["name"] for s in sources]
     con.execute(f"DELETE FROM source_status WHERE name NOT IN ({','.join('?' * len(names))})", names)
@@ -321,7 +355,10 @@ def config_snapshot(con):
     sources = [dict(name=s["name"], type=s.get("type", "rss"), url=s["url"], enabled=s.get("enabled", True),
                     origin=s["origin"], status=status.get(s["name"])) for s in load_config()]
     rows = con.execute("SELECT ts,source,level,message FROM fetch_log ORDER BY id DESC LIMIT 150").fetchall()
-    return dict(sources=sources, updating=False,
+    mins = get_refresh_minutes(con)
+    last_run = int(get_setting(con, "last_run", 0) or 0)
+    return dict(sources=sources, updating=False, refresh_minutes=mins,
+                next_run=(last_run + mins * 60) if mins else None,
                 last_update=max((v["last_attempt"] for v in status.values()), default=None),
                 log=[dict(ts=a, source=b, level=c, message=d) for a, b, c, d in rows])
 
@@ -374,7 +411,7 @@ def sample():
         return dict(ok=ok, last_attempt=now - 720, last_success=(now - ok_ago) if last_ok else None,
                     error=error, fetched=fetched, new=new)
 
-    cfg = dict(updating=False, last_update=now - 720, sources=[
+    cfg = dict(updating=False, last_update=now - 720, refresh_minutes=15, next_run=now + 480, sources=[
         dict(name="Demo · RSS", type="rss", url="https://example.com/feed", enabled=True, origin="base",
              status=st(True, 40, 6)),
         dict(name="Demo · Sitemap", type="sitemap", url="https://example.com/sitemap.xml", enabled=True,
@@ -395,15 +432,38 @@ def sample():
         dict(ts=now - 730, source="Demo · RSS", level="ok", message="40 entries, 6 new"),
         dict(ts=now - 4320, source="update", level="info", message="finished: 3 ok, 1 failed"),
     ])
-    render(con, {"CVE-2026-00001", "CVE-2026-00007"}, banner="Sample data: fictional headlines and sources, layout preview only",
-           cfg=cfg, demo=True)
+    def dash(i, name, sources=None):
+        return dict(id=i, name=name, all=sources is None, sources=sources or [], unread=0)
+
+    demo_state = dict(users=[dict(id=1, name="Alice"), dict(id=2, name="Bob")], dashboards={
+        "1": [dash(1, "Everything"), dash(2, "Vendor blogs", ["Demo · RSS", "Demo · Sitemap"]),
+              dash(3, "Local feeds", ["Demo · Scrape"])],
+        "2": [dash(4, "Everything"), dash(5, "Only RSS", ["Demo · RSS"])]})
+    render(con, {"CVE-2026-00001", "CVE-2026-00007"}, banner="Sample data: fictional headlines, sources and users, layout preview only",
+           cfg=cfg, demo=True, demo_state=demo_state)
 
 
 # ---------- rendering ----------
 
-def render(con, kev, banner="", cfg=None, demo=False):
-    rows = con.execute("SELECT title,url,source,published,summary,cves,tags FROM items "
-                       "ORDER BY published DESC LIMIT 400").fetchall()
+def _js(obj):
+    return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
+
+
+def load_items(con, kev, sources=None, user_id=None):
+    """Newest 400 items (only from `sources` if given) plus the Important items of `user_id`
+    (of any user when None). Important items outlive the retention window."""
+    if sources is not None and not sources:
+        return [], []
+    src_sql, src_params = "", []
+    if sources is not None:
+        src_sql = f" AND source IN ({','.join('?' * len(sources))})"
+        src_params = list(sources)
+    imp_sql = "SELECT url FROM user_important" + (" WHERE user_id = ?" if user_id is not None else "")
+    rows = con.execute(
+        "SELECT title,url,source,published,summary,cves,tags FROM items WHERE url IN "
+        f"(SELECT url FROM items WHERE 1=1{src_sql} ORDER BY published DESC LIMIT 400) "
+        f"OR (url IN ({imp_sql}){src_sql}) ORDER BY published DESC",
+        src_params + ([user_id] if user_id is not None else []) + src_params).fetchall()
     items, all_tags = [], set()
     for title, url, source, ts, summary, cves, tags in rows:
         cve_list = [c for c in cves.split(",") if c]
@@ -414,18 +474,32 @@ def render(con, kev, banner="", cfg=None, demo=False):
         all_tags.update(tag_list)
         items.append(dict(title=title, url=url, source=source, ts=ts, summary=summary,
                           cves=cve_list, kev=in_kev, tags=tag_list))
+    return items, sorted(all_tags)
+
+
+def items_payload(con, kev, sources=None, user_id=None):
+    """What the page needs to redraw itself without a reload (served at /api/items)."""
+    items, tags = load_items(con, kev, sources, user_id)
+    updated = con.execute("SELECT MAX(last_attempt) FROM source_status").fetchone()[0]
+    return dict(items=items, tags=tags, updated=updated or int(time.time()))
+
+
+def render(con, kev, banner="", cfg=None, demo=False, demo_state=None):
+    payload = items_payload(con, kev)
     cfg = cfg or config_snapshot(con)
-    page = (TEMPLATE.replace("__DATA__", json.dumps(items, ensure_ascii=False).replace("</", "<\\/"))
-            .replace("__TAGS__", json.dumps(sorted(all_tags)))
-            .replace("__CFG__", json.dumps(cfg, ensure_ascii=False).replace("</", "<\\/"))
-            .replace("__DEMO__", "true" if demo else "false")
-            .replace("__UPDATED__", time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()))
-            .replace("__BANNER__", f'<div class="banner">{html.escape(banner)}</div>' if banner else ""))
+    values = {
+        "DATA": _js(payload["items"]), "TAGS": _js(payload["tags"]), "CFG": _js(cfg),
+        "DEMO": "true" if demo else "false", "DEMOSTATE": _js(demo_state),
+        "GENERATED": str(cfg.get("last_update") or payload["updated"]),
+        "BANNER": f'<div class="banner">{html.escape(banner)}</div>' if banner else "",
+    }
+    # one pass over the template: text inside the values (e.g. a headline containing "__CFG__") is never re-scanned
+    page = re.sub(r"__(DATA|TAGS|CFG|DEMOSTATE|DEMO|GENERATED|BANNER)__", lambda m: values[m.group(1)], TEMPLATE)
     OUT.parent.mkdir(exist_ok=True)
     tmp = OUT.with_suffix(".tmp")  # atomic: the server never serves a half-written page
     tmp.write_text(page, encoding="utf-8")
     tmp.replace(OUT)
-    print(f"[+] wrote {OUT} ({len(items)} items)")
+    print(f"[+] wrote {OUT} ({len(payload['items'])} items)")
 
 
 TEMPLATE = """<!doctype html>
@@ -433,23 +507,31 @@ TEMPLATE = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Cyber News Dashboard</title>
 <style>
-:root{--bg:#f6f7f9;--card:#fff;--fg:#1a1d21;--mute:#667;--bd:#dde1e6;--acc:#2563eb;--kev:#dc2626}
-@media(prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#171b21;--fg:#e6e9ee;--mute:#8b95a3;--bd:#2a313b;--acc:#60a5fa;--kev:#f87171}}
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1a1d21;--mute:#667;--bd:#dde1e6;--acc:#2563eb;--kev:#dc2626;--star:#d97706}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1216;--card:#171b21;--fg:#e6e9ee;--mute:#8b95a3;--bd:#2a313b;--acc:#60a5fa;--kev:#f87171;--star:#fbbf24}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
 main{max-width:900px;margin:0 auto;padding:20px 16px}
-h1{font-size:1.4rem;margin:0}.sub{color:var(--mute);font-size:.85rem;margin-bottom:14px}
+h1{font-size:1.4rem;margin:0}.sub{color:var(--mute);font-size:.85rem}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.auto{display:inline-flex;align-items:center;gap:6px;font-size:.82rem;color:var(--mute);cursor:pointer;user-select:none}
 .banner{background:var(--card);border:1px dashed var(--acc);color:var(--acc);border-radius:8px;padding:6px 12px;margin-bottom:12px;font-size:.85rem}
 input{width:100%;padding:10px 12px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--fg);font:inherit}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 16px}
 .chip{border:1px solid var(--bd);background:var(--card);color:var(--fg);border-radius:999px;padding:3px 12px;cursor:pointer;font:inherit;font-size:.82rem}
 .chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.chip.imp{border-color:var(--star);color:var(--star)}
+.chip.imp.on{background:var(--star);border-color:var(--star);color:#1a1d21}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.card.imp{border-left:4px solid var(--star)}
+.card-top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px}
 .card a{color:var(--fg);font-weight:600;text-decoration:none}.card a:hover{color:var(--acc)}
+.star{flex:none;border:0;background:none;cursor:pointer;font-size:1.2rem;line-height:1.2;color:var(--mute);padding:0 2px}
+.star:hover,.star.on{color:var(--star)}
 .meta{color:var(--mute);font-size:.78rem;margin-top:2px}.sum{margin:6px 0;color:var(--mute);font-size:.88rem}
 .tag{display:inline-block;font-size:.72rem;border:1px solid var(--bd);border-radius:4px;padding:0 6px;margin-right:4px}
 .tag.kev{border-color:var(--kev);color:var(--kev);font-weight:700}
-.tabs{display:flex;gap:4px;border-bottom:1px solid var(--bd);margin-bottom:12px}
-.tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--mute);padding:8px 14px;cursor:pointer;font:inherit}
+.tabs{display:flex;flex-wrap:wrap;gap:4px;border-bottom:1px solid var(--bd);margin-bottom:12px}
+.tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--mute);padding:8px 14px;cursor:pointer;font:inherit;white-space:nowrap}
 .tab.on{color:var(--fg);border-bottom-color:var(--acc);font-weight:600}
 .card.read{opacity:.55}
 .foot{display:flex;justify-content:space-between;align-items:center;gap:8px}
@@ -460,7 +542,7 @@ input{width:100%;padding:10px 12px;border:1px solid var(--bd);border-radius:8px;
 input[type=checkbox]{width:auto}
 select{padding:10px 12px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--fg);font:inherit}
 .box{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:12px 14px;margin-bottom:14px}
-.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}.row>input{flex:1;min-width:140px}
+.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}.row>input{flex:1;min-width:140px}
 .cfgbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;color:var(--mute);font-size:.85rem}
 .note{border:1px dashed var(--acc);color:var(--acc);border-radius:8px;padding:6px 12px;margin-bottom:12px;font-size:.85rem}
 h3{font-size:1rem;margin:18px 0 8px}h3 label{font-weight:400;font-size:.8rem;color:var(--mute);margin-left:8px}
@@ -471,10 +553,25 @@ h3{font-size:1rem;margin:18px 0 8px}h3 label{font-weight:400;font-size:.8rem;col
 .logrow{font-size:.8rem;padding:3px 0;border-bottom:1px solid var(--bd);word-break:break-word}.lt{color:var(--mute);margin-right:6px}
 .logrow.error{color:var(--kev)}
 .empty{color:var(--mute);text-align:center;padding:30px 0}
+.tools{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.usersel{padding:4px 8px;font-size:.82rem}
+.dashbar{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 12px}
+.dash{border:1px solid var(--bd);background:var(--card);color:var(--fg);border-radius:8px;padding:5px 12px;cursor:pointer;font:inherit;font-size:.85rem}
+.dash.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.dash .cnt{opacity:.75;margin-left:6px;font-size:.78rem}
+.rd.pri{color:var(--acc);border-color:var(--acc)}
+.chk{font-size:.85rem;color:var(--mute);display:flex;align-items:center;gap:6px;margin:8px 0 4px}
+.urow{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid var(--bd)}.urow .nm{flex:1}
+.dcard{border:1px solid var(--bd);border-radius:8px;padding:10px 12px;margin-top:10px}.dcard.dirty{border-color:var(--acc)}
+.srcs{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:2px 12px;margin:6px 0 10px}
+.srcs label{font-size:.85rem;display:flex;align-items:center;gap:6px;cursor:pointer}.srcs label.off{opacity:.6}
 </style></head><body><main>
 <h1>Cyber News Dashboard</h1>
-<div class="sub">Updated __UPDATED__ · <span id="count"></span></div>
+<div class="top"><div class="sub">Updated <span id="updated"></span> · <span id="count"></span></div>
+<div class="tools"><select id="userSel" class="usersel" title="Switch user" aria-label="Switch user" hidden></select>
+<label class="auto" title="Server mode: loads new items as soon as an update finishes. Static mode: reloads the page every 10 minutes."><input type="checkbox" id="auto"> Auto-refresh</label></div></div>
 __BANNER__
+<div class="dashbar" id="dashbar" hidden></div>
 <nav class="tabs" id="tabs"></nav>
 <input id="q" type="search" placeholder="Search title, CVE, source…">
 <div class="chips" id="chips"></div>
@@ -482,6 +579,17 @@ __BANNER__
 <section id="cfg" hidden>
 <div class="cfgbar"><span id="cfgInfo"></span><button class="rd" id="upd" hidden>Update now</button></div>
 <div class="note" id="cfgMsg" hidden></div>
+<div class="box" id="schedBox" hidden><b>Refresh schedule</b>
+<div class="row"><label for="fEvery">Fetch all sources every</label><select id="fEvery"></select><span class="meta" id="nextRun"></span></div>
+<div class="meta">Applies to all sources. A change takes effect immediately; if the new interval has already passed since the last run, an update starts within seconds.</div>
+</div>
+<div class="box" id="accBox" hidden><b>Users</b> <span class="meta">Profiles without passwords: each has their own dashboards and read / Important flags. Anyone who can open this page can switch to any of them.</span>
+<div id="userList"></div>
+<div class="row"><input id="fUser" placeholder="New user name" maxlength="40" aria-label="New user name"><button class="rd" id="fUserAdd">Add user</button></div></div>
+<div class="box" id="dashBox" hidden><b>Dashboards of <span id="dashOwner"></span></b>
+<div class="meta">A dashboard shows only the sources you tick. The list of sources is shared by all users.</div>
+<div id="dashEditor"></div>
+<div class="row"><button class="rd" id="fDashNew">+ New dashboard</button></div></div>
 <div class="box" id="addBox" hidden><b>Add source</b>
 <div class="row"><input id="fUrl" placeholder="Site or feed URL"><input id="fName" placeholder="Name (optional)"></div>
 <div class="row"><select id="fType"><option value="detect">Auto-detect feed</option><option value="rss">RSS/Atom feed URL</option><option value="sitemap">Sitemap</option><option value="scrape">HTML scrape</option></select><button class="rd" id="fAdd">Add</button></div>
@@ -493,44 +601,137 @@ __BANNER__
 </section>
 </main>
 <script>
-const DATA=__DATA__, TAGS=__TAGS__, DEMO=__DEMO__;
-const KEY="cnd:read", VIEWS={all:"All",unread:"Not read",read:"Read",config:"Config"};
-let active=new Set(), q="", view="all", read=new Set(), shown=[];
+let DATA=__DATA__, TAGS=__TAGS__;
+const DEMO=__DEMO__, DEMOSTATE=__DEMOSTATE__, EMBEDDED=DATA;
+const KEY="cnd:read", IKEY="cnd:imp", AKEY="cnd:auto", UKEY="cnd:user", DKEY="cnd:dash:";
+const VIEWS={all:"All",unread:"Not read",read:"Read",config:"Config"};
+const EVERY=[[0,"Off (manual only)"],[10,"10 minutes"],[15,"15 minutes"],[30,"30 minutes"],[60,"1 hour"],[120,"2 hours"],[240,"4 hours"],[720,"12 hours"]];
+const AUTO_MS=30000, STATIC_RELOAD_MS=600000;
+let active=new Set(), q="", view="all", onlyImp=false, read=new Set(), important=new Set(), shown=[];
 let CFG=__CFG__, editable=DEMO, msg="", errOnly=false, poll=null, wasUpdating=false, synced=false;
-try{read=new Set(JSON.parse(localStorage.getItem(KEY)||"[]"))}catch(e){}
-const known=new Set(DATA.map(i=>i.url));
-read=new Set([...read].filter(u=>known.has(u)));
+let dataTs=__GENERATED__, known=new Set(), auto=false, autoT=null, loadedFor="";
+let USERS=[], me=null, DASHES=[], dash=null, drafts={};
+const loadedAt=Date.now();
 const $=id=>document.getElementById(id);
-const save=()=>{try{localStorage.setItem(KEY,JSON.stringify([...read]))}catch(e){}};
+const lsRaw=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+const lsGet=k=>{try{return JSON.parse(lsRaw(k)||"[]")}catch(e){return []}};
+const lsSet=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}};
+const save=()=>lsSet(KEY,JSON.stringify([...read]));
+const saveImp=()=>lsSet(IKEY,JSON.stringify([...important]));
+read=new Set(lsGet(KEY));important=new Set(lsGet(IKEY));
+try{auto=localStorage.getItem(AKEY)==="1"}catch(e){}
+function setData(items,tags){DATA=items;TAGS=tags;known=new Set(DATA.map(i=>i.url))}
+const tagsOf=items=>[...new Set(items.flatMap(i=>i.tags))].sort();
+const curDash=()=>DASHES.find(d=>d.id===dash);
+// demo preview: users and dashboards live in the page, filtering happens here
+function applyDemo(){const d=curDash();const items=!d||d.all?EMBEDDED:EMBEDDED.filter(i=>d.sources.includes(i.source));setData(items,tagsOf(items))}
+const demoUnread=d=>EMBEDDED.filter(i=>(d.all||d.sources.includes(i.source))&&!read.has(i.url)).length;
+setData(DATA,TAGS);
+if(DEMO&&DEMOSTATE){USERS=DEMOSTATE.users;me=USERS[0].id;DASHES=DEMOSTATE.dashboards[String(me)];dash=DASHES[0].id;applyDemo()}
+read=new Set([...read].filter(u=>known.has(u)));
+important=new Set([...important].filter(u=>known.has(u)));
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const ago=ts=>{const h=(Date.now()/1000-ts)/3600;return h<1?Math.round(h*60)+" min ago":h<48?Math.round(h)+" h ago":Math.round(h/24)+" d ago"};
+const ago=ts=>{const h=(Date.now()/1000-ts)/3600;return h<1?Math.max(1,Math.round(h*60))+" min ago":h<48?Math.round(h)+" h ago":Math.round(h/24)+" d ago"};
+const fmtDay=ts=>new Date(ts*1000).toLocaleString([],{weekday:"short",day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"});
+const fmtFull=ts=>new Date(ts*1000).toLocaleString([],{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"});
+const inMin=ts=>Math.max(1,Math.round((ts-Date.now()/1000)/60))+" min";
 const EMPTY={all:"No items match.",unread:"All caught up.",read:"Nothing marked as read yet."};
 // ---- server sync (only when served by server.py)
-async function loadRemote(){try{const r=await fetch("api/read",{cache:"no-store"});if(!r.ok)return;
-  const d=await r.json();if(!Array.isArray(d.read))return;
-  read=new Set(d.read.filter(u=>known.has(u)));synced=true;save();render();loadConfig()}catch(e){}}
-function push(urls,flag){if(!synced)return;
-  fetch("api/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({urls,read:flag})}).catch(()=>{})}
+const hdrs=()=>me?{"X-User":String(me)}:{};
+async function getJSON(path){const r=await fetch(path,{cache:"no-store",headers:hdrs()});if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}
 async function api(path,body){
   if(DEMO)throw new Error("demo preview, no server attached - nothing was changed");
-  const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body||{})});
+  const r=await fetch(path,{method:"POST",headers:Object.assign({"Content-Type":"application/json"},hdrs()),body:JSON.stringify(body||{})});
   let d={};try{d=await r.json()}catch(e){}
   if(!r.ok)throw new Error(d.error||"HTTP "+r.status);
   return d}
+function syncDrafts(){
+  const ids=new Set(DASHES.map(d=>String(d.id)));
+  for(const k of Object.keys(drafts))if(k!=="new"&&!ids.has(k))delete drafts[k];
+  for(const d of DASHES){const k=String(d.id);if(!drafts[k]||!drafts[k].dirty)drafts[k]={name:d.name,all:d.all,sources:[...d.sources],dirty:false}}}
+async function loadRemote(){
+  let u;
+  try{u=await getJSON("api/users")}catch(e){return}
+  if(!Array.isArray(u.users)||!u.users.length)return;
+  USERS=u.users;
+  if(!USERS.some(x=>x.id===me)){const s=Number(lsRaw(UKEY));me=USERS.some(x=>x.id===s)?s:USERS[0].id;lsSet(UKEY,String(me))}
+  try{
+    const [a,b,c]=await Promise.all([getJSON("api/read"),getJSON("api/important"),getJSON("api/dashboards")]);
+    if(!Array.isArray(a.read)||!Array.isArray(b.important)||!Array.isArray(c.dashboards))return;
+    read=new Set(a.read);important=new Set(b.important);DASHES=c.dashboards;synced=true;save();saveImp();
+  }catch(e){return}
+  syncDrafts();
+  if(!DASHES.some(d=>d.id===dash)){const w=Number(lsRaw(DKEY+me));dash=DASHES.some(d=>d.id===w)?w:(DASHES[0]?DASHES[0].id:null)}
+  await loadConfig();
+  if(loadedFor!==me+":"+dash)await loadItems()}
+async function refreshDashes(){
+  try{const c=await getJSON("api/dashboards");if(Array.isArray(c.dashboards)){DASHES=c.dashboards;syncDrafts();render()}}catch(e){}}
+function push(urls,flag){if(synced)api("api/read",{urls,read:flag}).then(refreshDashes).catch(()=>{})}
+function pushImp(urls,flag){if(synced)api("api/important",{urls,important:flag}).catch(()=>{})}
+async function loadItems(){
+  try{const d=await getJSON("api/items"+(dash?"?dashboard="+dash:""));if(!Array.isArray(d.items))return;
+    setData(d.items,d.tags||[]);dataTs=d.updated||dataTs;loadedFor=me+":"+dash;render()}catch(e){}}
 async function loadConfig(){
-  try{const r=await fetch("api/config",{cache:"no-store"});if(!r.ok)return;
-    CFG=await r.json();editable=true;
+  try{CFG=await getJSON("api/config");editable=true;
     if(CFG.updating){wasUpdating=true;if(!poll)poll=setInterval(loadConfig,1500)}
     else{if(poll){clearInterval(poll);poll=null}
-      if(wasUpdating){wasUpdating=false;msg="Update finished. Reload the page to see new items."}}
+      if(wasUpdating){wasUpdating=false;msg="Update finished.";await loadItems()}}
     render()}catch(e){}}
+async function selectDash(id){
+  if(id===dash)return;
+  dash=id;lsSet(DKEY+me,String(id));active.clear();
+  if(DEMO){applyDemo();render();return}
+  await loadItems()}
+async function switchUser(id){
+  me=id;lsSet(UKEY,String(id));dash=null;active.clear();onlyImp=false;drafts={};
+  if(DEMO){DASHES=DEMOSTATE.dashboards[String(me)];dash=DASHES[0].id;syncDrafts();applyDemo();render();return}
+  await loadRemote()}
+// ---- auto-refresh
+async function tick(){
+  if(document.hidden||DEMO)return;
+  if(synced){
+    await loadRemote();
+    if(!CFG.updating&&CFG.last_update&&CFG.last_update>dataTs)await loadItems();
+  }else if(Date.now()-loadedAt>STATIC_RELOAD_MS)location.reload()}
+function setAuto(on){
+  auto=on;lsSet(AKEY,on?"1":"0");clearInterval(autoT);autoT=null;
+  if(on){tick();autoT=setInterval(tick,AUTO_MS)}}
 function fromHash(){const h=location.hash.slice(1);view=VIEWS[h]?h:"all"}
 // ---- Config tab
+function renderSched(){
+  $("schedBox").hidden=!editable;if(!editable)return;
+  const cur=Number(CFG.refresh_minutes)||0,sel=$("fEvery");
+  const opts=EVERY.slice();if(!opts.some(o=>o[0]===cur))opts.push([cur,cur+" minutes"]);
+  if(document.activeElement!==sel){sel.innerHTML=opts.map(o=>`<option value="${o[0]}">${o[1]}</option>`).join("");sel.value=String(cur)}
+  $("nextRun").textContent=!cur?"Scheduled updates are off.":CFG.updating?"Updating now...":!CFG.next_run?"":CFG.next_run*1000<=Date.now()?"Next update: due now":"Next update in "+inMin(CFG.next_run)}
+function dcard(id,d,names){
+  const off=new Set(CFG.sources.filter(s=>!s.enabled).map(s=>s.name));
+  const all=names.concat(d.sources.filter(s=>!names.includes(s)));
+  const sources=all.map(s=>{const gone=!names.includes(s);
+    return `<label class="${gone||off.has(s)?"off":""}"><input type="checkbox" data-f="src" data-s="${esc(s)}" ${d.all||d.sources.includes(s)?"checked":""} ${d.all?"disabled":""}> ${esc(s)}${gone?" (not configured)":off.has(s)?" (disabled)":""}</label>`}).join("");
+  return `<div class="dcard ${d.dirty?"dirty":""}" data-id="${esc(id)}">
+    <div class="row"><input data-f="name" value="${esc(d.name)}" maxlength="40" placeholder="Dashboard name" aria-label="Dashboard name"></div>
+    <label class="chk"><input type="checkbox" data-f="all" ${d.all?"checked":""}> All sources (including ones added later)</label>
+    <div class="srcs">${sources}</div>
+    <div class="row"><button class="rd pri" data-da="save">${id==="new"?"Create":"Save"}</button>
+    ${id==="new"?`<button class="rd" data-da="cancel">Cancel</button>`:`<button class="rd" data-da="delete">Delete</button>`}</div></div>`}
+function renderAccounts(force){
+  const on=editable&&(synced||DEMO)&&USERS.length>0;
+  $("accBox").hidden=!on;$("dashBox").hidden=!on;if(!on)return;
+  // never rebuild while somebody is typing in a text field of these boxes (checkboxes and buttons are fine)
+  const ae=document.activeElement;
+  if(!force&&ae&&ae.matches("#accBox input:not([type=checkbox]),#dashBox input:not([type=checkbox])"))return;
+  $("userList").innerHTML=USERS.map(u=>`<div class="urow"><span class="nm">${esc(u.name)}${u.id===me?` <span class="tag">you</span>`:""}</span>
+    <button class="rd" data-ua="rename" data-id="${u.id}">Rename</button>${USERS.length>1?`<button class="rd" data-ua="delete" data-id="${u.id}">Delete</button>`:""}</div>`).join("");
+  const mine=USERS.find(u=>u.id===me);$("dashOwner").textContent=mine?mine.name:"";
+  const names=CFG.sources.map(s=>s.name);
+  $("dashEditor").innerHTML=Object.keys(drafts).map(id=>dcard(id,drafts[id],names)).join("")}
 function renderConfig(){
   $("cfgInfo").textContent="Last update: "+(CFG.last_update?ago(CFG.last_update):"never")+(CFG.updating?" · updating...":"");
   $("upd").hidden=!editable;$("upd").disabled=!!CFG.updating;$("addBox").hidden=!editable;
-  const note=editable?msg:"Read-only view: status as of the last build. Adding sources from here needs the self-hosted server (see README).";
+  const note=editable?msg:"Read-only view: status as of the last build. Users, dashboards, adding sources and the refresh schedule need the self-hosted server (see README).";
   $("cfgMsg").hidden=!note;$("cfgMsg").textContent=note;
+  renderSched();renderAccounts();
   $("cfgTable").innerHTML=CFG.sources.length?CFG.sources.map(s=>{
     const x=s.status,c=!s.enabled?"off":!x?"":x.ok?"ok":"bad",l=!s.enabled?"disabled":!x?"never fetched":x.ok?"OK":"FAILED",nm=esc(s.name);
     return `<div class="src ${c}"><div class="srch"><b>${nm}</b><span class="tag">${esc(s.type)}</span><span class="tag ${c==="bad"?"kev":""}">${l}</span>
@@ -547,42 +748,112 @@ function renderConfig(){
 // ---- main render
 function render(){
   const cfg=view==="config";
-  const n={all:DATA.length,read:DATA.filter(i=>read.has(i.url)).length};n.unread=n.all-n.read;
+  const nRead=DATA.filter(i=>read.has(i.url)).length,nImp=DATA.filter(i=>important.has(i.url)).length;
+  const n={all:DATA.length,read:nRead,unread:DATA.length-nRead};
   const f=DATA.filter(i=>(view==="all"||(view==="read")===read.has(i.url))&&
+    (!onlyImp||important.has(i.url))&&
     (!active.size||[...active].every(t=>i.tags.includes(t)))&&
     (!q||(i.title+i.source+i.summary+i.cves.join(" ")).toLowerCase().includes(q)));
   shown=cfg?[]:f;
   const bulkN=cfg?0:view==="read"?f.length:f.filter(i=>!read.has(i.url)).length;
   const failed=CFG.sources.filter(s=>s.enabled&&s.status&&!s.status.ok).length;
+  $("updated").textContent=fmtFull(dataTs);
+  const multi=(synced||DEMO)&&USERS.length>1,sel=$("userSel");
+  sel.hidden=!multi;
+  if(multi&&document.activeElement!==sel)sel.innerHTML=USERS.map(u=>`<option value="${u.id}" ${u.id===me?"selected":""}>👤 ${esc(u.name)}</option>`).join("");
+  const bar=(synced||DEMO)&&DASHES.length>1&&!cfg;
+  $("dashbar").hidden=!bar;
+  if(bar)$("dashbar").innerHTML=DASHES.map(d=>`<button class="dash ${d.id===dash?"on":""}" data-d="${d.id}" aria-pressed="${d.id===dash}">${esc(d.name)}<span class="cnt">${d.id===dash?n.unread:DEMO?demoUnread(d):(d.unread||0)}</span></button>`).join("");
   $("tabs").innerHTML=Object.keys(VIEWS).map(v=>`<button class="tab ${v===view?"on":""}" data-v="${v}">${VIEWS[v]}${v==="config"?(failed?" ⚠ "+failed:""):" ("+n[v]+")"}</button>`).join("")+
     (bulkN?`<button class="rd" id="bulk">${view==="read"?"Mark all as unread":"Mark all as read"} (${bulkN})</button>`:"");
   for(const id of ["q","chips","list"])$(id).hidden=cfg;
   $("cfg").hidden=!cfg;
   if(cfg){$("count").textContent=CFG.sources.length+" sources";renderConfig();return}
+  $("chips").innerHTML=`<button class="chip imp ${onlyImp?"on":""}" data-imp="1" aria-pressed="${onlyImp}">★ Important (${nImp})</button>`+
+    TAGS.map(t=>`<button class="chip ${active.has(t)?"on":""}" data-t="${esc(t)}">${esc(t)}</button>`).join("");
   $("count").textContent=f.length+" items";
-  $("list").innerHTML=f.length?f.map(i=>{const r=read.has(i.url);return `<div class="card ${r?"read":""}">
-    <a href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">${esc(i.title)}</a>
-    <div class="meta">${esc(i.source)} · ${ago(i.ts)}</div>
+  $("list").innerHTML=f.length?f.map(i=>{const r=read.has(i.url),s=important.has(i.url);return `<div class="card ${r?"read":""} ${s?"imp":""}">
+    <div class="card-top"><a href="${esc(i.url)}" target="_blank" rel="noopener noreferrer">${esc(i.title)}</a>
+    <button class="star ${s?"on":""}" data-s="${esc(i.url)}" aria-pressed="${s}" title="${s?"Remove Important flag":"Flag as Important"}">${s?"★":"☆"}</button></div>
+    <div class="meta">${esc(i.source)} · ${fmtDay(i.ts)} · ${ago(i.ts)}</div>
     ${i.summary?`<div class="sum">${esc(i.summary)}</div>`:""}
     <div class="foot"><div>${i.tags.map(t=>`<span class="tag ${t==="KEV"?"kev":""}">${esc(t)}</span>`).join("")}
     ${i.cves.slice(0,5).map(c=>`<span class="tag ${i.kev.includes(c)?"kev":""}">${esc(c)}</span>`).join("")}</div>
     <button class="rd" data-u="${esc(i.url)}">${r?"Mark as unread":"Mark as read"}</button></div></div>`}).join(""):
-    `<div class="empty">${EMPTY[view]}</div>`;
+    `<div class="empty">${onlyImp?"No important items match. Click ☆ on a card to flag it.":EMPTY[view]}</div>`;
 }
 // ---- events
-$("chips").innerHTML=TAGS.map(t=>`<button class="chip" data-t="${esc(t)}">${esc(t)}</button>`).join("");
-$("chips").onclick=e=>{const t=e.target.dataset.t;if(!t)return;
-  active.has(t)?active.delete(t):active.add(t);e.target.classList.toggle("on");render()};
+$("chips").onclick=e=>{const b=e.target.closest("button");if(!b)return;
+  if(b.dataset.imp)onlyImp=!onlyImp;
+  else if(b.dataset.t){const t=b.dataset.t;active.has(t)?active.delete(t):active.add(t)}
+  else return;
+  render()};
 $("tabs").onclick=e=>{
   if(e.target.id==="bulk"){const mark=view!=="read";
     shown.forEach(i=>mark?read.add(i.url):read.delete(i.url));save();push(shown.map(i=>i.url),mark);render();return}
   const v=e.target.dataset.v;if(!v)return;
   view=v;try{history.replaceState(null,"","#"+v)}catch(_){}render();if(v==="config")loadConfig()};
-$("list").onclick=e=>{const b=e.target.closest(".rd");if(!b)return;
+$("list").onclick=e=>{
+  const st=e.target.closest(".star");
+  if(st){const u=st.dataset.s,flag=!important.has(u);flag?important.add(u):important.delete(u);saveImp();pushImp([u],flag);render();return}
+  const b=e.target.closest(".rd");if(!b)return;
   const u=b.dataset.u,flag=!read.has(u);flag?read.add(u):read.delete(u);save();push([u],flag);render()};
+$("dashbar").onclick=e=>{const b=e.target.closest("[data-d]");if(b)selectDash(Number(b.dataset.d))};
+$("userSel").onchange=e=>switchUser(Number(e.target.value));
 $("q").oninput=e=>{q=e.target.value.toLowerCase();render()};
+$("auto").onchange=e=>setAuto(e.target.checked);
 $("fType").onchange=e=>{$("xSitemap").hidden=e.target.value!=="sitemap";$("xScrape").hidden=e.target.value!=="scrape"};
 $("errOnly").onchange=e=>{errOnly=e.target.checked;renderConfig()};
+$("fEvery").onchange=async e=>{
+  try{const d=await api("api/settings",{refresh_minutes:Number(e.target.value)});
+    msg=d.refresh_minutes?"Refresh interval saved: every "+d.refresh_minutes+" min.":"Scheduled updates turned off.";
+    e.target.blur();await loadConfig()}
+  catch(err){msg="Error: "+err.message;e.target.blur();render()}};
+// users
+$("accBox").onclick=async e=>{
+  const b=e.target.closest("button");if(!b)return;
+  try{
+    if(b.id==="fUserAdd"){const name=$("fUser").value.trim();const d=await api("api/users",{name});$("fUser").value="";
+      msg=`Added user "${name}". Pick them from the 👤 menu at the top.`;await loadRemote()}
+    else if(b.dataset.ua==="rename"){const id=Number(b.dataset.id),cur=(USERS.find(u=>u.id===id)||{}).name||"";
+      const name=prompt("New name",cur);if(name===null)return;await api("api/users/rename",{id,name});msg="User renamed.";await loadRemote()}
+    else if(b.dataset.ua==="delete"){const id=Number(b.dataset.id),u=USERS.find(x=>x.id===id);
+      if(!confirm(`Delete user "${u?u.name:id}" with all their dashboards and flags?`))return;
+      await api("api/users/delete",{id});msg="User deleted.";if(id===me){me=null;dash=null;drafts={}}await loadRemote()}
+    else return;
+  }catch(err){msg="Error: "+err.message;render()}};
+// dashboards (drafts survive re-renders; nothing is sent until Save)
+const card=el=>el.closest(".dcard");
+$("dashBox").addEventListener("input",e=>{
+  const c=card(e.target);if(!c||e.target.dataset.f!=="name")return;
+  const d=drafts[c.dataset.id];d.name=e.target.value;d.dirty=true;c.classList.add("dirty")});
+$("dashBox").addEventListener("change",e=>{
+  const c=card(e.target),f=e.target.dataset.f;if(!c||!f)return;
+  const d=drafts[c.dataset.id];d.dirty=true;
+  if(f==="all"){d.all=e.target.checked;renderAccounts(true)}
+  else if(f==="src"){const s=e.target.dataset.s,i=d.sources.indexOf(s);
+    if(e.target.checked&&i<0)d.sources.push(s);else if(!e.target.checked&&i>=0)d.sources.splice(i,1);c.classList.add("dirty")}});
+$("dashBox").onclick=async e=>{
+  const b=e.target.closest("button");if(!b)return;
+  if(b.id==="fDashNew"){drafts["new"]={name:"",all:false,sources:[],dirty:true};renderAccounts(true);return}
+  const c=card(b);if(!c)return;
+  const id=c.dataset.id,d=drafts[id],act=b.dataset.da;
+  try{
+    if(act==="cancel"){delete drafts["new"];renderAccounts(true);return}
+    if(act==="save"){
+      const body={name:d.name,all:d.all,sources:d.all?[]:d.sources};
+      if(id==="new"){const r=await api("api/dashboards",body);delete drafts["new"];msg=`Dashboard "${d.name.trim()}" created.`;
+        await refreshDashes();await selectDash(r.id)}
+      else{await api("api/dashboards/update",Object.assign({id:Number(id)},body));d.dirty=false;msg="Dashboard saved.";
+        await refreshDashes();if(Number(id)===dash)await loadItems()}
+      renderAccounts(true);render()}
+    else if(act==="delete"){
+      if(!confirm(`Delete dashboard "${d.name}"?`))return;
+      await api("api/dashboards/delete",{id:Number(id)});msg="Dashboard deleted.";delete drafts[id];
+      if(Number(id)===dash){dash=null}await refreshDashes();
+      if(dash===null){dash=DASHES[0]?DASHES[0].id:null;lsSet(DKEY+me,String(dash));await loadItems()}
+      renderAccounts(true);render()}
+  }catch(err){msg="Error: "+err.message;render()}};
 $("cfg").onclick=async e=>{
   const b=e.target.closest("button");if(!b)return;
   const a=b.dataset.a,n=b.dataset.n,v=id=>$(id).value.trim();
@@ -603,8 +874,10 @@ $("cfg").onclick=async e=>{
   }catch(err){msg="Error: "+err.message;render()}
 };
 window.addEventListener("hashchange",()=>{fromHash();render()});
-document.addEventListener("visibilitychange",()=>{if(!document.hidden)loadRemote()});
-fromHash();render();loadRemote();
+document.addEventListener("visibilitychange",()=>{if(!document.hidden){auto?tick():loadRemote()}});
+$("auto").checked=auto;
+syncDrafts();fromHash();render();loadRemote();
+if(auto)autoT=setInterval(tick,AUTO_MS);
 </script></body></html>
 """
 
